@@ -219,6 +219,20 @@ export class Queue {
   }
 
   /**
+   * Schedule a retry with exponential backoff delay.
+   * Updates delay_until so the worker picks it up after the delay.
+   */
+  scheduleRetry(id: string, attempt: number): void {
+    const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 30000)
+    const delayUntil = Date.now() + backoff
+    this.db.prepare(`
+      UPDATE ${this.table}
+      SET status = 'pending', error = NULL, delay_until = ?
+      WHERE id = ? AND status = 'failed'
+    `).run(delayUntil, id)
+  }
+
+  /**
    * Get job stats: counts by status.
    */
   stats(): { pending: number; processing: number; completed: number; failed: number; total: number } {
@@ -328,6 +342,8 @@ export class Worker {
       }
 
       this.queue.markProcessing(job.id)
+      // markProcessing increments attempts in DB, track locally
+      const currentAttempt = job.attempts + 1
 
       try {
         await handler(job)
@@ -335,14 +351,12 @@ export class Worker {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
 
-        if (job.attempts >= job.maxAttempts) {
+        if (currentAttempt >= job.maxAttempts) {
           this.queue.markFailed(job.id, msg)
         } else {
-          // Revert to pending so it gets picked again
+          // Mark as failed first, then schedule retry with backoff
           this.queue.markFailed(job.id, msg)
-          // Auto-retry with exponential backoff
-          const retryDelay = Math.min(1000 * Math.pow(2, job.attempts), 30000)
-          setTimeout(() => this.queue.retry(job.id), retryDelay)
+          this.queue.scheduleRetry(job.id, currentAttempt)
         }
       }
     }
